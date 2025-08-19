@@ -360,7 +360,8 @@ class Initializer(BaseClass):
 
 # Main inference class.
 class Analyzer(BaseClass):
-    def __init__(self, initializer, output_path, start_time, end_time, debug_mode, merge, overlap, device, output_type, embed=False, fast=False, thread_num=1):
+    def __init__(self, initializer, output_path, start_time, end_time, debug_mode, merge, overlap,
+                 device, output_type, embed=False, fast=False, thread_num=1, base_offset=0.0):
         super().__init__()
         self.init = initializer
         self.output_path = output_path
@@ -373,6 +374,7 @@ class Analyzer(BaseClass):
         self.embed = embed
         self.fast = fast
         self.thread_num = thread_num
+        self.base_offset = base_offset
 
         if cfg.infer.min_score == 0:
             self.merge_labels = False # merging all labels >= min_score makes no sense in this case
@@ -699,7 +701,7 @@ class Analyzer(BaseClass):
     def _save_labels(self, labels, file_path, rarities):
         if rarities:
             if len(labels) == 0:
-                return # don't write to rarities if none for this species
+                return  # don't write to rarities if none for this species
 
             if not self.have_rarities_directory and not os.path.exists(self.rarities_output_path):
                 os.makedirs(self.rarities_output_path)
@@ -709,19 +711,22 @@ class Analyzer(BaseClass):
         else:
             output_path = os.path.join(self.output_path, f'{Path(file_path).stem}_HawkEars.txt')
 
-        logging.info(f"Thread {self.thread_num}: Writing {output_path}")
+        logging.info(f"Thread {self.thread_num}: Writing {output_path} (append)")
         try:
-            with open(output_path, 'w') as file:
+            # APPEND so each cycle adds lines to the same file
+            with open(output_path, 'a') as file:
                 for label in labels:
-                    if cfg.infer.use_banding_codes:
-                        name = label.class_code
-                    else:
-                        name = label.class_name
+                    # banding code vs common name
+                    name = label.class_code if cfg.infer.use_banding_codes else label.class_name
 
-                    file.write(f'{label.start_time:.2f}\t{label.end_time:.2f}\t{name};{label.score:.3f}\n')
+                    # Apply the base offset (0, 20, 40, … seconds)
+                    start_adj = label.start_time + getattr(self, "base_offset", 0.0)
+                    end_adj   = label.end_time   + getattr(self, "base_offset", 0.0)
+
+                    file.write(f'{start_adj:.2f}\t{end_adj:.2f}\t{name};{label.score:.3f}\n')
 
                     if self.embed and not rarities:
-                        # save offsets with labels for use when saving embeddings
+                        # (unchanged) keep offsets-with-labels bookkeeping if you use embeddings
                         self.offsets_with_labels = {}
                         curr_time = label.start_time
                         self.offsets_with_labels[label.start_time] = 1
@@ -730,9 +735,8 @@ class Analyzer(BaseClass):
                                 curr_time += self.overlap
                             else:
                                 curr_time += cfg.audio.segment_len
-
                             self.offsets_with_labels[curr_time] = 1
-        except:
+        except Exception:
             logging.error(f"Unable to write file {output_path}")
             quit()
 
@@ -988,6 +992,8 @@ if __name__ == '__main__':
     parser.add_argument('-s', '--start', type=str, default='', help="Optional start time in hh:mm:ss format, where hh and mm are optional.")
     parser.add_argument('--threads', type=int, default=cfg.infer.num_threads, help=f'Number of threads. Default = {cfg.infer.num_threads}')
     parser.add_argument('--power', type=float, default=cfg.infer.audio_exponent, help=f'Power parameter to mel spectrograms. Default = {cfg.infer.audio_exponent}')
+    parser.add_argument('--offset', type=float, default=0.0,
+                    help='Seconds to add to all label times (0, 20, 40, … for rolling clips).')
 
     # arguments for location/date processing
     parser.add_argument('--date', type=str, default=None, help=f'Date in yyyymmdd, mmdd, or file. Specifying file extracts the date from the file name, using the file_date_regex in base_config.py.')
@@ -1094,13 +1100,17 @@ if __name__ == '__main__':
     num_threads = min(num_threads, len(init.file_info_list)) # don't need more threads than recordings
     if num_threads == 1:
         # keep it simple in this case
-        analyzer = Analyzer(init, output_path, args.start, args.end, args.debug, args.merge, args.overlap, device, output_type, args.embed, args.fast, 1)
+        analyzer = Analyzer(init, output_path, args.start, args.end, args.debug, args.merge, args.overlap,
+                    device, output_type, args.embed, args.fast, 1, base_offset=args.offset)
+
         analyzers.append(analyzer)
         analyzer.run()
     else:
         threads = []
         for i in range(num_threads):
-            analyzer = Analyzer(init, output_path, args.start, args.end, args.debug, args.merge, args.overlap, device, output_type, args.embed, args.fast, i + 1)
+            analyzer = Analyzer(init, output_path, args.start, args.end, args.debug, args.merge, args.overlap,
+                    device, output_type, args.embed, args.fast, i + 1, base_offset=args.offset)
+
             analyzers.append(analyzer)
             thread = threading.Thread(target=analyzer.run, args=())
             thread.start()
